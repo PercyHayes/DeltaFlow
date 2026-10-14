@@ -1,0 +1,8 @@
+.local/
+.deps/
+.venv/
+__pycache__/
+*.pyc
+rtl/target/
+rtl/project/target/
+rtl/project/project/
