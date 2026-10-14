@@ -1,6 +1,6 @@
-# GPU trace exports
+# GPU profiles
 
-These retained GDN chunk-forward Nsight traces use an NVIDIA A100, H = 32, D = 128 and C = 64. Filename B and T identify batch and sequence length.
+These GDN chunk-forward traces were recorded with Nsight on an NVIDIA A100, using H = 32, D = 128 and chunk size 64. The filenames identify batch size B and sequence length T.
 
 | File | Batch | Tokens |
 | --- | ---: | ---: |
@@ -9,4 +9,4 @@ These retained GDN chunk-forward Nsight traces use an NVIDIA A100, H = 32, D = 1
 | gdn_b1_t8192.json | 1 | 8,192 |
 | gdn_b32_t8192.json | 32 | 8,192 |
 
-Open any JSON using **Open trace file** at [ui.perfetto.dev](https://ui.perfetto.dev/). These are viewable exports; CUDA and Nsight are not required to open them.
+Select **Open trace file** in the [Perfetto web viewer](https://ui.perfetto.dev/) and choose one of these JSON files.

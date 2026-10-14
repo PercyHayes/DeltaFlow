@@ -1,5 +1,9 @@
 # GPU and TPU profiles
 
-The [GPU](gpu/README.md) and [TPU](tpu/README.md) folders contain Chrome Trace exports for GDN. Open a local JSON file using **Open trace file** in the [Perfetto web viewer](https://ui.perfetto.dev/). See [Perfetto's UI documentation](https://perfetto.dev/docs/visualization/perfetto-ui).
+Open the GDN traces in [gpu](gpu/README.md) and [tpu](tpu/README.md) with the [Perfetto web viewer](https://ui.perfetto.dev/):
 
-For compressed TPU files, decompress locally first using the commands in the TPU README. The profiles are historical GPU/TPU runs, not four-head RTL inputs.
+1. Decompress a `.json.gz` file using the commands in the TPU README.
+2. Open the viewer and select **Open trace file**.
+3. Choose the JSON file from your machine.
+
+For the JSON files in the GPU folder, start at step 2. See [Perfetto's UI guide](https://perfetto.dev/docs/visualization/perfetto-ui) for navigation controls.

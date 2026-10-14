@@ -1,34 +1,48 @@
-# Chipyard Direct AXI4 integration
+# Chipyard integration
 
-DeltaFlow uses [Chipyard](https://github.com/ucb-bar/chipyard) through [FSA's integration](https://github.com/VCA-EPFL/chipyard-fsa), following [FSA](https://github.com/VCA-EPFL/FSA)'s Direct AXI4 organization. There is one accelerator system for all operation modes. The payload path does not route sixteen HBM streams through the host register bus.
+DeltaFlow uses Chipyard's AXI4 register nodes, I/O binders and harness binders to connect the accelerator to the host and external memory. The host interface submits instructions and reads completions. Sixteen separate AXI4 ports carry tensor data through DMA. Chipyard describes these mechanisms in its [register-router guide](https://chipyard.readthedocs.io/en/stable/TileLink-Diplomacy-Reference/Register-Router.html) and [I/O and harness binder guide](https://chipyard.readthedocs.io/en/stable/Customization/IOBinders.html).
 
-## Regenerate the complete system
+## Generate the complete system
 
-Install the dependency using [Environment](environment.md), then:
+Install the build environment from [Environment](environment.md#chisel-and-chipyard), then run these commands from the project root:
 
 ```bash
 source scripts/env.sh
 bash scripts/elaborate_chipyard.sh
 bash scripts/build_sim.sh .local/chipyard/DeltaFlowHarness.sv .local/sim_fresh
+python examples/generate.py gemm --m 256 --n 256 --k 2048 --out .local/examples/gemm
 python scripts/run_sim.py .local/examples/gemm --binary .local/sim_fresh/chipyard_hbm
 ```
 
-`setup_chipyard.py` adds the two release Scala source directories to the dependency's `lazy val chipyard` generator project. It does not rewrite FSA source files. The dependency build uses `DELTAFLOW_REPO_ROOT` to select this release, so export that environment before elaborating. The selected compact PE is explicit in `DirectAXI4.scala`.
+`scripts/elaborate_chipyard.sh` calls `scripts/setup_chipyard.py` to add `rtl/src/main/scala` and `rtl/chipyard/src/main/scala` to Chipyard's Scala build. `DELTAFLOW_REPO_ROOT`, set by `scripts/env.sh`, tells that build where to find the DeltaFlow sources. The generator runs `DeltaFlow16Config` with `DeltaFlowHarness`, and firtool writes `.local/chipyard/DeltaFlowHarness.sv`.
 
-The generator uses `deltaflow.integration.DeltaFlow16Config` and `deltaflow.integration.DeltaFlowHarness`. The former selects four physical 64 × 64 tiles. The standalone `PublicElaborate core` entry emits only the four-tile core; it does not replace complete-system integration or STA.
+The main modules are:
 
-The supplied `generated/DeltaFlowHarness.sv` is the retained full-system RTL. It includes the host bus, MMIO, direct-port binders and all four tiles. Fresh elaboration is required after changing Scala or the integration configuration. Always build and test the new generated file explicitly.
+| Module | Role |
+| --- | --- |
+| `FourTileSystem` | Four compute tiles, DMA engines and instruction dispatch |
+| `AXI4DeltaFlow` | Instruction registers, completion FIFO and DMA AXI4 nodes |
+| `DeltaFlow16Config` | Four-tile configuration and external interface bindings |
+| `DeltaFlowHarness` | Chipyard host interface, clock/reset and external memory ports |
 
-## Interfaces
+`DirectAXI4.scala` selects the compact PE implementation. `generated/DeltaFlowHarness.sv` is the full-system SystemVerilog used by the default simulation command. After editing Scala or the configuration, regenerate the RTL and pass the new `.sv` file to `scripts/build_sim.sh` as shown above. `PublicElaborate core` generates `FourTileSystem` for standalone core work.
 
-`AXI4DeltaFlow` has an AXI4RegisterNode at 0x8000 with a 4-KiB window and 4-byte register beats. The external 32-bit host AXI interface enters Chipyard's FBUS, then the register bridge. There is no RISC-V CPU in this accelerator harness.
+## Host interface
 
-Sixteen AXI4MasterNode payload lanes are exported directly using Chipyard IO and harness binders. Each lane carries 256-bit data and burst control. Tile t owns global lanes `4*t` through `4*t+3`. Each lane's 4-GiB address window starts at `(lane+1)<<32`; instruction addresses are offsets within these independent windows. Four heads can use the same offsets with different lane contents.
+`AXI4DeltaFlow` creates an `AXI4RegisterNode` at address 0x8000 with a 4-KiB register window and 4-byte register transfers. The external 32-bit host AXI interface reaches it through Chipyard's front bus and register bridge.
 
-The harness supplies one clock/reset domain and reports a nominal 1,000 MHz reference clock. The clock declaration is a configuration parameter, not a timing-closure directive or a physical frequency guarantee. Synthesis and STA constraints are provided by [the timing flow](synthesis.md).
+The host writes four instruction words, submits them, then polls the completion FIFO. [Programming](programming.md#mmio) lists the register offsets and completion fields. An external host or CPU drives this interface.
 
-## Board integration
+## Memory interfaces
 
-Connect the external host AXI interface to the host/CPU register master and the sixteen payload ports to compatible HBM controller channels or an AXI interconnect. Preserve the tile bandwidth budget, ordering, backpressure and write responses. Provide the clock/reset and any physical clock-domain bridges required by the platform. Upload and download tensors through HBM; the register transport only submits metadata and drains completions.
+Sixteen AXI4 master ports handle DMA reads and writes. Each port has 256-bit data and burst control. Tile t uses global lanes `4*t` through `4*t+3`. I/O binders export the ports from the Chipyard system, and harness binders connect them to the outer harness.
 
-The release does not include a vendor HBM controller, PHY or board-specific pinout. For simulation, the C++ harness supplies the sixteen AXI service models and validates actual payload transfers through the same external interfaces.
+Each lane has an independent 4-GiB address window starting at `(lane+1)<<32`. DMA instructions specify an offset within that window. Four heads can use identical offsets because their input data and state occupy different lane windows.
+
+Each tile has a 128-byte/cycle aggregate payload budget across its four lanes; all four tiles total 512 bytes/cycle. The C++ testbench services these ports with the AXI memory model described in [Simulation](simulation.md#axihbm-service-model).
+
+## Clock and platform connections
+
+`DeltaFlowHarness` uses one clock/reset domain and configures a 1,000-MHz reference clock. The [STA flow](synthesis.md#full-system-sta) applies a 1.0-ns clock period to the generated netlist.
+
+For a board implementation, connect the host AXI interface to a register master and the sixteen DMA ports to HBM controller channels or an AXI interconnect. Supply clock/reset and the clock-domain bridges required by the platform. Keep AXI ordering, backpressure and write responses intact. The host submits instructions through registers and transfers tensor data through HBM.

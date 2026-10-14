@@ -1,10 +1,10 @@
 # Synthesis, area and timing
 
-The flow uses uniform **ASAP7 LVT, TT, 0.7 V, 25 °C** standard cells. No standard cell Liberty, LEF, GDS or downloaded SRAM macro is distributed in this release. Only project-generated SRAM RTL and the local budget-view generator are included.
+Use Yosys with Slang to synthesize the SystemVerilog, then run OpenSTA on the mapped netlist. The standard-cell library is **ASAP7 LVT, TT, 0.7 V, 25 °C** throughout the design.
 
-## Download the process library
+## Download the standard-cell library
 
-Obtain the ASAP7 platform from [OpenROAD-flow-scripts](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts). Its [ASAP7 configuration](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts/blob/master/flow/platforms/asap7/config.mk) defines the threshold and NLDM corner groups. Download to a dependency directory:
+Download the ASAP7 platform from [OpenROAD-flow-scripts](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts) into `.deps/`:
 
 ```bash
 mkdir -p .deps
@@ -13,7 +13,7 @@ git -C .deps/orfs sparse-checkout set flow/platforms/asap7
 export ASAP7_LIB_DIR="$PWD/.deps/orfs/flow/platforms/asap7/lib/NLDM"
 ```
 
-Use these **five LVT/TT files**, with the exact dated library names below:
+The scripts read these five **LVT/TT** files:
 
 ```text
 asap7sc7p5t_SEQ_LVT_TT_nldm_220123.lib
@@ -23,29 +23,35 @@ asap7sc7p5t_OA_LVT_TT_nldm_211120.lib.gz
 asap7sc7p5t_SIMPLE_LVT_TT_nldm_211120.lib.gz
 ```
 
-`prepare_lvt.py` merges these external groups into the run directory. It retains the original tables and units. The standard-cell library uses ps and fF; OpenSTA command units are explicitly ns and pF. The mapper's load is 1 fF; the STA output load is 0.001 pF. Do not silently substitute RVT, SLVT, FF or SS.
+`scripts/prepare_lvt.py` merges them into one Liberty file in the run directory, preserving the cell tables and units. The library uses ps and fF; the STA scripts set their command units to ns and pF. Synthesis uses a 1-fF output load, and STA uses the equivalent 0.001-pF load. The platform's [ASAP7 configuration](https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts/blob/master/flow/platforms/asap7/config.mk) describes its library groups.
 
-P&R is not implemented here. A future LVT P&R flow also needs the matching 1x technology/cell LEF, GDS and RC views from that upstream platform, and a real SRAM implementation. Those downloads belong in the local dependency directory.
+## SRAM models and area estimates
 
-## Generated SRAM budget views
+Generate the SRAM files with:
 
 ```bash
 python scripts/generate_sram.py --out .local/sram
 ```
 
-The generator emits three exact 1R1W functional/blackbox interfaces and an illustrative Liberty file. Functional RTL matches byte masks, independent read and write addresses, one-cycle synchronous reads and held read output. Synthesis uses blackboxes; it must not synthesize the behavioral memory array into FFs.
+For each of the three SRAM sizes, the script writes:
 
-| Macro | Instances in complete chip | Budget area per instance, µm² |
+- `<name>.sv`: a read/write simulation model with independent read and write addresses, byte write masks and a one-cycle synchronous read. The read output holds its value when read enable is low.
+- `<name>_bb.sv`: the memory's port declarations for synthesis. Yosys preserves each instance as an SRAM block.
+- `deltaflow_sram.lib`: SRAM area, input capacitance, read delay and setup/hold parameters for synthesis and STA.
+
+The matching `.sv` and `_bb.sv` files are in `rtl/memory_models/`. `scripts/build_sim.sh` uses the read/write models, and `scripts/synthesize.py` uses the blackbox declarations and generated Liberty file.
+
+| SRAM size | Instances in the full system | Estimated area per instance, µm² |
 | --- | ---: | ---: |
 | 1,024 × 128, 1R1W | 64 | 8,310.904 |
 | 512 × 128, 1R1W | 64 | 4,212.376 |
 | 256 × 32, 1R1W | 64 | 540.778 |
 
-Total SRAM budget area is 836,099.712 µm². These retained estimates came from FakeRAM geometry with an assumed 1.5 multiplier for the port organization. The generator fixes the resulting areas so reproducing this budget does not require FakeRAM. Its timing assumptions are 0.2183 ns access, 0.05 ns setup, 0.05 ns hold and 0.005 pF input capacitance. They are not transistor characterization, SRAM power measurements or a manufacturable macro.
+The total estimated SRAM area is 836,099.712 µm². These values come from FakeRAM geometry estimates scaled by 1.5 for the port organization. The generator stores the resulting values directly. Its timing parameters are 0.2183 ns read access, 0.05 ns setup, 0.05 ns hold and 0.005 pF input capacitance.
 
-## Fresh synthesis
+## Synthesize the full system
 
-Use explicit tool paths from [Environment](environment.md). Keep work paths free of spaces and command delimiters because the Slang frontend consumes its file arguments directly.
+Use the tool paths from [Environment](environment.md). Choose a project path without spaces, semicolons or quotation marks for the Slang command invocation.
 
 ```bash
 python scripts/synthesize.py \
@@ -55,13 +61,15 @@ python scripts/synthesize.py \
   --out .local/synthesis
 ```
 
-The flow selects SRAM blackboxes, elaborates SV with Slang, shares identical RTLIL module definitions by direct body equality, and keeps every physical instance. It flattens arithmetic within PE/FP32 modules while preserving panel/tile hierarchy. It removes simulation assertions for synthesis, maps flip-flops and uses ABC with an 800-ps mapping target. It excludes the same `*x1p*`, `*xp*`, SDF and ICG cells as the retained screening setup.
+The script loads the SRAM blackboxes, reads the SystemVerilog with Slang and synthesizes each distinct module definition while preserving all instances. It flattens arithmetic inside the PE and FP32 modules and keeps the panel/tile hierarchy. It removes simulation assertions, maps flip-flops and runs ABC with an 800-ps delay target. The mapping library excludes `*x1p*`, `*xp*`, SDF and ICG cells.
 
-Outputs include frontend and mapping logs, `stat.json` and `mapped.v`. The complete linked design area includes the illustrative SRAM area. ABC's module delay is a screening statistic, not full-chip STA. Fresh mapping may differ from the selected reference; it does not reproduce the subsequent load repair and local cell-sizing campaign automatically.
+The output directory holds the synthesis logs, cell-area report `stat.json` and mapped netlist `mapped.v`. Its total area combines mapped standard cells with the SRAM estimates above. Use ABC's reported module delays to compare mappings, then run OpenSTA to analyze timing across the complete hierarchy.
 
-## Complete linked STA
+`scripts/synthesize.py` produces the initial mapped netlist. The netlist in `reference/` also has fanout buffers and resized control cells from timing optimization.
 
-Run a fresh mapped netlist:
+## Full-system STA
+
+To analyze the newly synthesized netlist, run:
 
 ```bash
 python scripts/run_sta.py \
@@ -71,7 +79,7 @@ python scripts/run_sta.py \
   --out .local/sta_fresh --threads 4
 ```
 
-Or analyze the actual selected complete mapped reference shipped as three compressed parts, each below GitHub's single-file size limit:
+To analyze the optimized netlist in `reference/`, run:
 
 ```bash
 python scripts/run_sta.py \
@@ -80,17 +88,28 @@ python scripts/run_sta.py \
   --out .local/sta_reference --threads 4
 ```
 
-The script concatenates/decompresses the parts in the run directory, reads the complete four-tile hierarchy and the generated SRAM budget views, then links all modules. It never substitutes one tile's timing for the full system.
+The reference netlist is stored in three compressed parts. The script joins and decompresses them into the run directory, loads the standard-cell and SRAM Liberty files, and links the four-tile `DeltaFlowHarness` hierarchy.
 
-Constraints are a 1.0-ns ideal clock, 0.1-ns setup uncertainty, 0.025-ns clock transition, 0.1-ns input/output delay, 0.05-ns input transition and 0.001-pF output load. There are no false paths, multicycle paths or mode exemptions. Reports include setup coverage, WNS, TNS, full paths and electrical violations.
+The STA constraints are:
 
-The retained selected-reference result is WNS +0.001853 ns, TNS 0, logic area 10.279465544 mm² and area with SRAM budget 11.115565256 mm². Its worst reported logic after Q is 0.845190 ns, so the separate 800-ps logic design budget was not reached. This is ideal-clock, pre-layout setup analysis, not physical 1-GHz signoff. Wire parasitics, CTS, P&R and characterized SRAM are absent.
+| Constraint | Value |
+| --- | ---: |
+| Ideal clock period | 1.0 ns |
+| Setup uncertainty | 0.1 ns |
+| Clock transition | 0.025 ns |
+| Input/output delay | 0.1 ns |
+| Input transition | 0.05 ns |
+| Output load | 0.001 pF |
 
-Full reference STA previously took about 46 minutes with four threads and about 185 GiB peak RAM. Allow real available memory to determine whether a run can continue; do not terminate simply at an arbitrary RSS threshold. Reduce threads if genuinely necessary. Keep logs and run directories for diagnosis.
+STA evaluates setup paths throughout the linked design. The run directory contains setup coverage, WNS, TNS, detailed paths and electrical-violation reports.
 
-## Small arithmetic probe
+The reference netlist produced WNS +0.001853 ns, TNS 0, logic area 10.279465544 mm² and total area 11.115565256 mm² with the SRAM estimates above. Its longest reported combinational delay after Q is 0.845190 ns. This analysis uses the mapped netlist, an ideal clock and the SRAM timing parameters above. Placement and routing supply the wire and clock-tree delays for physical timing analysis.
 
-Before a full run, elaborate the selected PE and exercise the same mapping and STA scripts on it:
+The full reference run took about 46 minutes with four threads and peaked at about 185 GiB RAM. Use `--threads` to set the OpenSTA thread count and retain the run directory to inspect its reports.
+
+## PE synthesis and STA
+
+For a smaller run, generate the PE and use the same synthesis and STA scripts:
 
 ```bash
 source scripts/env.sh
@@ -105,4 +124,4 @@ python scripts/run_sta.py --sta .local/opensta-build/sta \
   --top RetimedWavePE --out .local/pe_sta
 ```
 
-A positive PE WNS does not prove array/controller or complete-system closure.
+Use the PE flow to compare arithmetic implementations quickly. The full-system flow evaluates paths through the tile controllers, SRAM interfaces and Chipyard logic.

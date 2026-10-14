@@ -1,65 +1,101 @@
 # Simulation
 
-## Build the full system
+## Build the simulator
 
-From the release root, after [environment setup](environment.md):
+Set up the tools following [Environment](environment.md), then run from the project root:
 
 ```bash
 source scripts/env.sh
 BUILD_JOBS=32 SIM_THREADS=8 bash scripts/build_sim.sh
 ```
 
-This compiles the complete Chipyard SystemVerilog, including all four 64 × 64 tiles, DMA, MMIO and the outer harness. Subarrays are compiled separately to reduce build cost. The script replaces the inline SRAM module with project-generated functional 1R1W models. Assertions are enabled. No process library is needed.
+`scripts/build_sim.sh` compiles `generated/DeltaFlowHarness.sv` and the C++ testbench into `.local/sim/chipyard_hbm`. The generated system contains four 64 × 64 tiles, DMA engines, MMIO and the Chipyard harness. The script compiles subarrays separately to reduce build cost and uses the 1R1W read/write models from `rtl/memory_models/` for SRAM simulation. Hardware assertions are enabled.
 
-## Generate and run workloads
+## Run the examples
+
+Each example starts with `examples/generate.py`, which writes its instruction stream, initial HBM contents and expected outputs. `scripts/run_sim.py` runs that example with the simulator.
+
+**GEMM:** four independent matrices use the same shape and broadcast instruction stream.
 
 ```bash
 python examples/generate.py gemm --m 256 --n 256 --k 2048 --out .local/examples/gemm
 python scripts/run_sim.py .local/examples/gemm
+```
 
+**GDN prefill:** B = 1, H = 4, Dk = Dv = 128 and chunk size 64.
+
+```bash
 python examples/generate.py prefill --tokens 1024 --out .local/examples/prefill
 python scripts/run_sim.py .local/examples/prefill
+```
 
+The input generator alternates two synthetic chunks. Each head starts from a nonzero H0 and keeps its state in SRAM across the sequence. Set `--tokens` to a multiple of 64, from 64 through 65,536. Longer sequences produce larger HBM images and take more host time to simulate.
+
+**Decode:** GDN_STEP processes four successive tokens per head.
+
+```bash
 python examples/generate.py decode --decode-tokens 4 --out .local/examples/decode
 python scripts/run_sim.py .local/examples/decode
+```
 
+**Replay:** reconstruct the state for accepted draft tokens and execute the next decode token.
+
+```bash
 python examples/generate.py replay --accepted 2 --out .local/examples/replay
 python scripts/run_sim.py .local/examples/replay
 ```
 
-Use a new output directory when changing a completed example. GEMM is four independent matrices with one broadcast shape/program. Prefill is B = 1, H = 4, Dk = Dv = 128 and C = 64. Two raw synthetic blocks alternate and each head has an independent resident state initialized to the provided nonzero H0. The supported generator length is any multiple of 64 up to 65,536; long runs take more host time and generate larger HBM images.
+Replay first runs history and draft tokens, saving a checkpoint and corrected E through HBM writes. It then reloads the checkpoint, reads the cached K, decay and E, rebuilds H for the accepted tokens, and runs the next decode token. `--accepted` selects 0, 2 or 4 draft tokens.
 
-Decode processes actual single tokens using STEP, without padding every token to a C64 chunk. Replay first computes and exports history, restores an actual HBM checkpoint, reads corrected E from actual previous output writes, rebuilds the accepted state and executes the next decode token. `--accepted` selects 0, 2 or 4 draft tokens. It never substitutes host-precomputed E for the cache.
+The CPU reference in `examples/arithmetic.py` calculates expected results in the accelerator's FP32/BF16 operation order. The testbench compares the RTL's output writes against those results. GEMM uses small integer inputs; the recurrent examples generate separate seeded inputs for each tile. Choose a separate output directory for each workload configuration.
 
-The ordered FP32/BF16 numerical oracle is used only to generate expected HBM writes. It recomputes prefill U/W from the provided raw inputs. RTL performs all accelerator calculations. GEMM uses exact small integer inputs; recurrent examples use separate seeded inputs on each tile. Functional checks retain state, numerical, protocol and output-mask comparisons.
+## Input and output files
 
-## Fixture and result formats
+The generator writes four files:
 
-Each directory contains `program_16.hex`, `memory_16.txt`, `sections_16.txt` and `workload_16.json`. The HBM image format is:
+| File | Purpose |
+| --- | --- |
+| `program_16.hex` | 128-bit instruction stream |
+| `memory_16.txt` | Initial HBM contents and expected output writes |
+| `sections_16.txt` | Workload section boundaries for reporting |
+| `workload_16.json` | Workload dimensions and options |
+
+The HBM data file uses this format:
 
 ```text
 M lane offset_hex data_256bit_hex
 E lane offset_hex expected_256bit_hex mask_256bit_hex
 ```
 
-M records initialize external memory. E records describe masked expected writes and do not initialize that memory. The driver observes actual AXI W handshakes, compares every required write and waits for the final fence, all completions and idle before reporting PASS. It produces `result_16.json` and instruction, DMA, chunk and section-event CSVs. RTL assertions and protocol errors terminate the run. The driver has a bounded 20-million-cycle timeout.
+An M record initializes one HBM beat. An E record specifies an expected output value and the bits to compare. The driver checks AXI write handshakes against these expected outputs. It reports PASS after the final fence, all completions and the idle state, and saves `result_16.json` plus instruction, DMA, chunk and section-event CSV files. Numerical mismatches, protocol errors and hardware assertion failures stop the simulation. The driver allows up to 20 million cycles per run.
 
-For the full array, measured main utilization is `panel_waves / (64 * cycles)`. Each panel wave represents 256 main MACs. The denominator includes MMIO, HBM traffic, preparation, draining and final H. Auxiliary FP32 work is not included in the main-array numerator. GEMM tails can perform padded work; for useful GEMM utilization use `4 * M * N * K / (16384 * cycles)` as well. Native decode/replay use auxiliary lanes, so a low or zero main-array utilization is not a failure of those modes.
+## Utilization counters
+
+Main-array utilization is `panel_waves / (64 * cycles)`. The system has 64 subarrays, and each panel wave represents 256 main MACs. The cycle count covers the complete program: instruction submission, HBM traffic, preparation, computation and final output/state transfers.
+
+For GEMM, `4 * M * N * K / (16384 * cycles)` reports useful utilization for four independent matrices of the same shape. This formula counts useful matrix operations, while the panel-wave counter also counts padding at matrix edges. Decode and replay execute on the auxiliary FP32 lanes; use their cycle counts to measure latency. The panel-wave metric measures activity in the main systolic array.
 
 ## AXI/HBM service model
 
-The testbench models AR/R/AW/W/B handshakes, burst bounds, response delays and backpressure. Each lane has at most eight inflight read bursts; DMA bursts are at most sixteen 32-byte beats and respect 4-KiB boundaries. Read service starts after `12 + lane % 4` cycles; B follows the last W by `19 + lane % 4` cycles. Periodic stalls affect AR, AW, W and R. Payload service is limited to one beat per lane per cycle, with read/write sharing the lane budget.
+The C++ testbench services the AR/R/AW/W/B channels with burst limits, response delays and periodic backpressure:
 
-It is an AXI service model, not bank-aware HBM, refresh, PHY or board timing. Do not treat its cycles as a measured physical HBM platform result.
+- Each lane permits up to eight outstanding read bursts.
+- DMA bursts carry up to sixteen 32-byte beats and split at 4-KiB boundaries.
+- Read service begins after `12 + lane % 4` cycles.
+- The B response follows the last write beat by `19 + lane % 4` cycles.
+- Periodic stalls apply to AR, AW, W and R.
+- Each lane transfers at most one payload beat per cycle, shared between reads and writes.
+
+These service rules determine the external-memory latency and bandwidth seen by the simulated accelerator.
 
 ## Generate RTL from Chisel
 
-Follow [Integration](integration.md) to generate the complete Chipyard hierarchy and pass the resulting SV to `scripts/build_sim.sh`. [Synthesis and timing](synthesis.md) also shows how to generate a small PE for area and timing analysis.
+Follow [Integration](integration.md) to generate `.local/chipyard/DeltaFlowHarness.sv`, then pass that file to `scripts/build_sim.sh`. [Synthesis and timing](synthesis.md#pe-synthesis-and-sta) shows how to generate a PE for a smaller synthesis run.
 
-For a detached run, redirect files and standard input explicitly:
+## Run in the background
+
+To keep a simulation running after an SSH disconnect, redirect its input and output and start it in a separate session:
 
 ```bash
 nohup setsid python scripts/run_sim.py .local/examples/prefill > .local/prefill.log 2>&1 < /dev/null &
 ```
-
-This survives an SSH disconnect; a container or machine restart still stops it.

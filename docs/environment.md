@@ -1,27 +1,31 @@
 # Environment
 
-Use Linux x86-64 with a working GCC/G++ toolchain. RTL simulation does not require a GPU.
+This project runs on Linux x86-64 with GCC/G++, Make and Verilator. RTL simulation runs on the CPU.
 
-## Tested tools
+Recommended RAM is about **220 GiB** for the complete RTL generation, synthesis and full-system STA flow. For RTL simulation, plan for **32–64 GiB** when compiling the simulator and **8–16 GiB** when running the compiled examples. Set `BUILD_JOBS` to control parallel compilation and its memory use.
 
-| Tool | Tested version | Purpose |
+## Tool versions
+
+The following versions were used to build and run DeltaFlow:
+
+| Tool | Version | Purpose |
 | --- | --- | --- |
-| Python | 3.13.14 | Compiler, fixtures and flow scripts |
-| NumPy | 2.2.5 | Numerical expectations and data packing |
-| GCC/G++ | 13.3 | Verilator and ordered FP32 reference |
+| Python | 3.13.14 | Compiler, example data and flow scripts |
+| NumPy | 2.2.5 | Numerical reference and tensor packing |
+| GCC/G++ | 13.3 | Simulator and FP32 reference compilation |
 | GNU Make | 4.3 | Simulator compilation |
-| Verilator | 5.022 | RTL simulation with assertions and hierarchical builds |
-| Java | 20.0.2 | Tested JVM; Chipyard upstream also documents its JVM requirements |
+| Verilator | 5.022 | RTL simulation |
+| Java | 20.0.2 | Scala build runtime |
 | sbt | 1.8.2 | Scala build |
 | Scala | 2.13.16 | RTL sources |
-| Chisel / compiler plugin | 6.7.0 | RTL elaboration |
-| CIRCT firtool | 1.75.0 | FIRRTL lowering |
-| Yosys with Slang plugin | 0.69+136 | SV synthesis |
-| OpenSTA | 3.1.0 | Linked netlist timing |
-
-Python 3.11 or later can install the pinned NumPy package; the software was tested with the version in the table. Do not substitute a different floating-point reference compiler flag such as `-ffast-math`.
+| Chisel / compiler plugin | 6.7.0 | RTL generation |
+| CIRCT firtool | 1.75.0 | FIRRTL to SystemVerilog |
+| Yosys with Slang plugin | 0.69+136 | SystemVerilog synthesis |
+| OpenSTA | 3.1.0 | Static timing analysis |
 
 ## Python setup
+
+Use Python 3.11 or later for the NumPy version in `requirements.txt`:
 
 ```bash
 python3 -m venv .venv
@@ -30,11 +34,13 @@ python -m pip install -r requirements.txt
 source scripts/env.sh
 ```
 
-`uv venv .venv --python 3.13` followed by `uv pip install -r requirements.txt` is an alternative. A conda environment with the same requirements also works. On first use in each process, the numerical reference compiles `examples/arithmetic_native.c` with GCC into a private temporary directory under `.local/reference/`. The loaded object remains valid after its temporary file is removed; independent fixture generators never overwrite a shared object.
+Alternatively, create the environment with `uv venv .venv --python 3.13` and install packages with `uv pip install -r requirements.txt`. A Conda environment can use the same requirements file.
 
-## Tools for direct RTL simulation
+The examples calculate expected results with `examples/arithmetic.py` and `examples/arithmetic_native.c`. On first use, Python compiles the C reference with GCC in `.local/reference/`. The compiler flags `-fno-fast-math` and `-ffp-contract=off` preserve the reference's floating-point operation order.
 
-Install Verilator 5.022, GCC/G++ and Make using your distribution or an isolated conda environment. The supplied complete `generated/DeltaFlowHarness.sv` permits simulation without installing sbt, Chipyard or EasyFloat.
+## RTL simulation tools
+
+Install Verilator 5.022, GCC/G++ and Make using your Linux package manager or a Conda environment. The simulator builds directly from `generated/DeltaFlowHarness.sv`.
 
 ```bash
 verilator --version
@@ -42,11 +48,11 @@ g++ --version
 make --version
 ```
 
-`scripts/build_sim.sh` handles the conda Verilator executable/include layout inside `.local/verilator_root`. It does not replace the system installation. Use `BUILD_JOBS=32` and `SIM_THREADS=8` as starting values. Reducing build jobs can lower compilation memory. Simulator threads affect host execution time, not hardware cycles.
+For a Conda Verilator installation, `scripts/build_sim.sh` prepares the executable and include files under `.local/verilator_root`. Set `BUILD_JOBS` to control parallel compilation and `SIM_THREADS` to control simulator threads. Start with `BUILD_JOBS=32` and `SIM_THREADS=8`, then adjust them to the CPU and memory available on your machine. Simulator threads change host runtime; hardware cycle counts come from the simulated circuit.
 
-## Dependencies for Chisel and Chipyard
+## Chisel and Chipyard
 
-Obtain [chipyard-fsa](https://github.com/VCA-EPFL/chipyard-fsa), branch `msaga-main`, including its submodules. It supplies the [Chipyard](https://github.com/ucb-bar/chipyard) integration and [EasyFloat](https://github.com/VCA-EPFL/easyfloat), located at `generators/easyfloat/src/main/scala`; it is not copied into this release. The setup command follows FSA's published setup.
+Follow [Chipyard's setup guide](https://chipyard.readthedocs.io/en/stable/Chipyard-Basics/Initial-Repo-Setup.html) to install Conda. The commands below install the Chipyard build environment used with the tool versions above. The setup script initializes its submodules and Scala dependencies:
 
 ```bash
 mkdir -p .deps
@@ -57,17 +63,19 @@ cd ../..
 source scripts/env.sh
 ```
 
-Set `CHIPYARD_DIR=/path/to/chipyard-fsa` before sourcing `scripts/env.sh` to use an existing installation. That script sources the dependency's `env.sh` when present. Set `DELTAFLOW_SKIP_CHIPYARD_ENV=1` if your tools are already configured. Existing JVM proxy options are preserved. In a restricted network, configure your Maven/Coursier mirror and proxy before running sbt. The JVM uses a short relative `.local/tmp` directory to avoid sbt 1.8.2's Unix socket path limit on long workspace paths; actual temporary files stay in the current build directory.
+`scripts/env.sh` sets `CHIPYARD_DIR` to `.deps/chipyard-fsa` and loads that checkout's `env.sh`. The Scala build reads its floating-point sources from `$CHIPYARD_DIR/generators/easyfloat/src/main/scala`. Project links and credits are in the README's [Acknowledgements](../README.md#acknowledgements).
+
+To select an existing installation, set `CHIPYARD_DIR=/path/to/chipyard-fsa` before sourcing `scripts/env.sh`. If your shell already has the required tools configured, set `DELTAFLOW_SKIP_CHIPYARD_ENV=1`. Configure Maven/Coursier mirrors and JVM proxy options before running sbt when your network requires them. The environment script uses `.local/tmp` for JVM temporary files so sbt can run from long workspace paths.
 
 ## Synthesis and STA tools
 
-Download the Linux build of [OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build/releases), which includes the Yosys Slang plugin. Extract it under `.deps/` and pass its Yosys executable using `--yosys`. Do not add this alternate Yosys to the global PATH. Confirm that it supports `read_slang` and `synth -hieropt`:
+Download a Linux [OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build/releases) build with the Yosys Slang plugin and extract it under `.deps/`. Pass `.deps/oss-cad-suite/bin/yosys` to synthesis with `--yosys`, so the scripts use that installation. The synthesis flow uses `read_slang` and `synth -hieropt`; display their options with:
 
 ```bash
 .deps/oss-cad-suite/bin/yosys -Q -p 'help read_slang; help synth'
 ```
 
-For OpenSTA, use a compatible standalone installation or build the [official source](https://github.com/The-OpenROAD-Project/OpenSTA). The upstream build requires CMake, C++, Tcl, SWIG, zlib and Eigen. One local build arrangement is:
+Build [OpenSTA](https://github.com/The-OpenROAD-Project/OpenSTA) with CMake, a C++ compiler, Tcl, SWIG, zlib and Eigen. Follow its README for OS dependency packages, then run:
 
 ```bash
 git clone https://github.com/The-OpenROAD-Project/OpenSTA.git .deps/OpenSTA
@@ -75,4 +83,4 @@ cmake -S .deps/OpenSTA -B .local/opensta-build -DCMAKE_BUILD_TYPE=Release
 cmake --build .local/opensta-build -j 32
 ```
 
-Pass the resulting `sta` binary explicitly with `--sta`. Follow the upstream README for the dependency packages on your OS. Full-system STA previously used about 185 GiB RAM; plan for at least 210–220 GiB available RAM and several GiB of disk space. A PE probe needs much less memory.
+Pass `.local/opensta-build/sta` to timing analysis with `--sta`. The full-system STA run peaked at about 185 GiB RAM; allocate about 210–220 GiB and several GiB of disk space for the same design. Use the [PE example](synthesis.md#pe-synthesis-and-sta) to try the flow on a smaller module.

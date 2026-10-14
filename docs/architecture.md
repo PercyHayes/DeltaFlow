@@ -8,11 +8,11 @@ The Chipyard harness exposes a host AXI register interface and sixteen direct AX
 
 The figure expands Tile 1; all four tiles use the same compute and memory organization. The DMA engines are system-level components, with four channels serving each tile.
 
-The sixteen payload ports have 256-bit data. Each tile owns four ports and a nominal 128-byte/cycle aggregate payload quota; the chip total is 512 bytes/cycle. Read and write traffic share each modeled lane's service quota. These are logical AXI ports and bandwidth budgets, not a physical HBM PHY.
+Each payload port transfers 256-bit data. Four ports give each tile a 128-byte/cycle aggregate payload budget, and the four tiles total 512 bytes/cycle. The simulation model shares each lane's transfer budget between reads and writes.
 
 ## Tile and PE
 
-A tile contains sixteen independently controlled 16 × 16 systolic subarrays forming a 64 × 64 main array, plus an auxiliary unit with 65 FP32 arithmetic lanes. The auxiliary unit has 64 shared FMA lanes for gate processing, local triangular computation and state updates, and one FP32 prefix lane. Four local inverse controllers maintain the diagonal-block computation and share the FMA lanes; they are not additional groups of arithmetic lanes. The four tiles provide 16,384 main MACs/cycle. Subarrays support output-stationary (OS) and weight-stationary (WS) execution, independent completion/ownership and bounded operand/result handoff.
+A tile contains sixteen independently controlled 16 × 16 subarrays forming a 64 × 64 systolic array, plus 65 auxiliary FP32 lanes. Of these, 64 shared FMA lanes process gates, local triangular blocks and state updates; one prefix lane computes cumulative gate products. Four local inverse controllers share the 64 FMA lanes to solve diagonal blocks. The four tiles provide 16,384 main MACs per cycle. Each subarray supports output-stationary (OS) and weight-stationary (WS) execution and tracks when its operands and results are ready for the next operation.
 
 Each PE contains one BF16 coefficient register, **COEF**, four FP32 accumulation registers, **ACC0–ACC3**, and a five-stage FMA pipeline. The FMA performs BF16 multiplication with FP32 accumulation; the FP32 addend enters at the alignment stage.
 
@@ -20,17 +20,17 @@ In OS mode, north and west operands propagate south and east, while a selected A
 
 <p align="center"><img src="assets/systolic_os_animated.svg" alt="OS operand propagation and four interleaved accumulator contexts" width="960"></p>
 
-The animation shows a 4 × 4 crop of one 16 × 16 subarray and the shared FMA inside a PE. Colored ACC registers identify independent accumulation contexts. Playback illustrates operand propagation and context interleaving; it does not measure execution cycles or resource occupancy. A [GIF version](assets/systolic_os.gif) is also available.
+The animation shows a 4 × 4 crop of one 16 × 16 subarray. Operands move through the array while four colored ACC contexts interleave through each PE's shared FMA. [View the GIF](assets/systolic_os.gif).
 
-In WS mode, COEF holds the stationary coefficient. The FMA multiplies it by the north input, adds the west partial sum and forwards the result east, bypassing ACC0–ACC3. Arithmetic metadata and operand/sum transfers follow the corresponding pipeline, including its advance/backpressure controls.
+In WS mode, COEF holds the stationary coefficient. The FMA multiplies it by the north input, adds the west partial sum and forwards the result east. ACC0–ACC3 hold OS partial sums. Tags, operands and partial sums advance with the pipeline and wait together when downstream backpressure stalls it.
 
-GDN uses local FP32 triangular processing, WS transform application and OS state/output updates in one array. Completed subarrays drive dependent updates; future preparation can overlap released portions of the current suffix. The hardware preserves subarray ownership, state recursion, rounding boundaries and backpressure. The next chunk can begin its state-dependent computations after both its preparation and the previous state update finish.
+GDN prepares local triangular blocks with the FP32 lanes, applies their transforms in WS mode and computes state/output updates in OS mode. When a subarray finishes its current work, the scheduler can use it for the next chunk's preparation. The next chunk starts its state-dependent computations once its preparation and the previous chunk's state update have both finished.
 
 <p align="center"><img src="assets/gdn_execution_animated.svg" alt="GDN chunk preparation, shared state projection and output/state updates" width="960"></p>
 
-The animation follows successive steady-state chunk intervals. The computation boxes map onto shared array and FP32 resources rather than separate hardware units. Current-chunk projections reuse the buffered incoming state; the output projection remains in ACC for the subsequent output update. Next-chunk preparation advances when inputs and resources are available, while its state-dependent projection waits for the completed recurrent state. A [GIF version](assets/gdn_execution.gif) is also available.
+The animation follows successive chunks. Its boxes represent operations on the shared array and FP32 lanes. The current chunk's projections reuse buffered incoming state, and the output projection stays in ACC for the following output update. Preparation for the next chunk uses subarrays as they become available; its state projection waits for the completed recurrent state. [View the GIF](assets/gdn_execution.gif).
 
-## Fixed SRAM budget
+## SRAM organization
 
 | Space, per tile | Banks | Words per bank | Bits per word | Capacity |
 | --- | ---: | ---: | ---: | ---: |
@@ -41,14 +41,14 @@ The animation follows successive steady-state chunk intervals. The computation b
 
 Every bank is independent-address 1R1W, with a synchronous one-cycle read and byte-masked write. Read data holds when read enable is low. On a same-edge same-address read/write, the functional model reads the previous contents. The complete chip contains 192 macros, with 64 instances of each geometry.
 
-Operand stores packed GEMM A/B buffers or GDN Q/K/V and preparation staging. Work stores GEMM output/seed pages or GDN intermediates and the resident FP32 state. Gate stores scalar decay/interval coefficients consumed by correlation and transform preparation. The paper's architecture diagram labels the 16-KiB gate region as Aux SRAM. Separate banks allow useful concurrent accesses; competing accesses to the same bank still arbitrate.
+Operand SRAM holds packed GEMM A/B buffers, or GDN Q/K/V, preparation data and output staging. Work SRAM holds GEMM output/seed pages, or GDN intermediates and the resident FP32 state. Gate SRAM holds scalar decay and interval coefficients used in correlation and transform preparation; the paper labels this 16-KiB region as Aux SRAM. Accesses to different banks can proceed concurrently, while accesses to the same bank share its read and write ports.
 
-For Dk = Dv = 128, H occupies 64 KiB in Work rows 256–511. It remains on chip across chunks. Only the initial H is loaded and the final H is exported for the next layer/session. O is BF16 and exported per chunk. The included SRAM models are generated project RTL; their optional area/timing views are budgets, not characterized or manufacturable SRAM.
+For Dk = Dv = 128, H occupies 64 KiB in Work rows 256–511. DMA loads the initial H once, and H remains on chip across chunks. DMA writes the final H after the sequence and BF16 O after each chunk. [Synthesis and timing](synthesis.md#sram-models-and-area-estimates) describes the simulation models and SRAM area estimates.
 
 ## Operation support
 
 GEMM uses OS accumulation over bounded K segments and supports M/N tails. The compiler maps 128 × 128 output patches per tile onto the four ACC contexts of the physical 64 × 64 array. Larger matrices use multiple patches and K segments. Inputs are BF16; GEMM output and intermediate accumulation are FP32.
 
-GDN prefill uses C = 64, with Q/K/V in BF16, activated scalar decay and beta in FP32, internal state in FP32 and O in BF16. Preparation and the current state/output phase overlap where ownership permits. Native decode uses the existing FP32 lanes for short recurrent updates. REBUILD consumes cached corrected E plus K and decay to reconstruct H from an HBM checkpoint, avoiding recomputing the state projection for those tokens.
+GDN prefill uses chunk size 64, with BF16 Q/K/V, FP32 activated scalar decay and beta, FP32 state and BF16 O. Next-chunk preparation uses resources released by the current state/output phase. Decode runs short recurrent updates on the FP32 lanes. REBUILD reads cached corrected E, K and decay to reconstruct H from an HBM checkpoint.
 
-The implemented gate is scalar per token. Native KDA requires channel-level gate handling and is not claimed by the current chunk engine. Projection layers that generate Q/K/V/g are separate GEMMs, not an implemented full LLM application in these examples.
+The chunk engine takes one scalar decay gate per token. The examples load Q/K/V and activated gate values from HBM. Use GEMM programs for the matrix multiplications in the preceding projection layers.

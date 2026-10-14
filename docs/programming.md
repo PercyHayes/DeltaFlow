@@ -1,10 +1,10 @@
 # Programming interface
 
-All tensor values come from HBM through DMA. Instructions carry control fields, dimensions, masks, local locations and addresses. They do not carry gates, weights, state, outputs or other tensor payloads.
+DMA transfers all tensor values between HBM and local SRAM. The 128-bit instructions specify operations, dimensions, tile/context masks and memory addresses. The host submits them through MMIO.
 
 ## Instruction envelope
 
-Each instruction is 128 bits. Hex files contain one 32-digit word per line. MMIO writes its four 32-bit words in least-significant-word-first order. Bits 7:0 are the opcode, 11:8 the tile mask, and 31:16 the completion tag. Tags are unique within an epoch; drain the final system fence before reusing tags, changing modes or repurposing HBM/local storage. The software rejects more than 65,535 tagged commands in one epoch.
+Each instruction is 128 bits. Hex files contain one 32-digit word per line. MMIO writes its four 32-bit words in least-significant-word-first order. Bits 7:0 are the opcode, 11:8 the tile mask, and 31:16 the completion tag. Give each instruction a unique tag until the final SYSTEM_FENCE completes. After that fence, tags and storage can be reused and the operation mode can change. The software permits up to 65,535 tagged commands in one such execution interval.
 
 There are **15 implemented opcodes**:
 
@@ -20,13 +20,13 @@ There are **15 implemented opcodes**:
 | 0x12 | SYSTEM_FENCE | Drain selected compute and DMA work |
 | 0x13 | BUFFER_FENCE | Wait for input-buffer consumption and DMA |
 | 0x14 | DMA_FENCE | Drain selected DMA work |
-| 0x21 | GDN_CHUNK | Run one C64 preparation/suffix or prepared suffix |
-| 0x22 | GDN_PREPARE | Prepare the next raw slot while legal resources overlap |
-| 0x23 | GDN_RELEASE | Release a completed output slot after DMA |
-| 0x24 | GDN_STEP | Native short recurrence, including single-token decode |
-| 0x25 | GDN_REBUILD | Rebuild H using cached corrected E |
+| 0x21 | GDN_CHUNK | Execute a C64 chunk, optionally using previously prepared transforms |
+| 0x22 | GDN_PREPARE | Prepare the next chunk using available subarrays and auxiliary lanes |
+| 0x23 | GDN_RELEASE | Make an output slot reusable after its DMA store completes |
+| 0x24 | GDN_STEP | Run 1–64 recurrent tokens, including single-token decode |
+| 0x25 | GDN_REBUILD | Reconstruct H from K, decay and cached corrected E |
 
-Opcode 0x20 is not a payload or gate-loading instruction and is not supported. Use DMA for activated scalar gate inputs. Unused and reserved bits are zero.
+Load activated scalar gate values from HBM with DMA_LOAD. Set unused and reserved instruction bits to zero.
 
 ## Compute format: 0x00–0x04
 
@@ -43,7 +43,7 @@ Opcode 0x20 is not a payload or gate-loading instruction and is not supported. U
 | 111:96 | n_valid | Valid N extent of the 128-column output patch |
 | 127:112 | reserved | Zero |
 
-Not every field is used by every opcode. CLEAR and FENCE ignore operand data; STORE/SEED transfer selected ACC registers (ACC0–ACC3). The reference compiler and packer in `software/deltaflow/gemm_stream.py` and `system.py` define their concrete layout.
+CLEAR initializes the selected ACC contexts, and FENCE waits for pending compute work. STORE writes the selected ACC registers to local storage; SEED loads them from local storage. `software/deltaflow/gemm_stream.py` and `software/deltaflow/system.py` pack these fields into instruction words.
 
 ### GEMM tiling and accumulation
 
@@ -51,7 +51,7 @@ The stream compiler divides C = AB into 128 × 128 output patches. Four 64 × 64
 
 <p align="center"><img src="assets/gemm_tiling_animated.svg" alt="GEMM output-patch tiling and interleaved ACC updates" width="960"></p>
 
-For each reduction index k, the tile issues updates to ACC0, ACC1, ACC2 and ACC3 before advancing k. CLEAR initializes a new output patch once; successive GEMM_ACC commands retain its partial sums across K segments. STORE waits for the selected ACC updates to retire, then writes the completed patch to Work SRAM. The animation shows successive output patches and representative K ranges; a highlighted input subdivision groups vector updates rather than representing one complete matrix multiplication per issue wave. Its playback timing is illustrative. A [GIF version](assets/gemm_tiling.gif) is also available.
+For each reduction index k, the tile updates ACC0, ACC1, ACC2 and ACC3 before advancing k. CLEAR initializes a new output patch once, and successive GEMM_ACC commands accumulate its partial sums across K segments. STORE waits for the selected updates to retire, then writes the completed patch to Work SRAM. The animation shows how output patches and K segments map onto these accumulator contexts; highlighted input regions group the vector updates within a segment. [View the GIF](assets/gemm_tiling.gif).
 
 ## DMA format: 0x10–0x11
 
@@ -70,7 +70,7 @@ For each reduction index k, the tile issues updates to ACC0, ACC1, ACC2 and ACC3
 
 Beat index i maps to local row `i // 2` and the first bank `8 * (i % 2) + 2 * port`; one beat joins two 128-bit banks. `pack_rows()` produces the four independent HBM lane streams. The normal four-tile configuration binds independent 4-GiB windows at `(lane + 1) << 32`, where `lane = 4 * tile + port`. Use offsets within each window.
 
-Fence formats carry opcode, tile mask and tag; the remaining bits are zero. DMA completion includes B responses for stores. A buffer fence is narrower than a system fence and should only replace it when the compiler has established the corresponding operand lifetime.
+Fence instructions carry the opcode, tile mask and tag, with the remaining bits set to zero. DMA_STORE completes after its B responses arrive. BUFFER_FENCE waits for DMA and input-buffer consumption so the compiler can refill consumed input buffers; SYSTEM_FENCE also waits for pending compute work to finish.
 
 ## Chunk and preparation format: 0x21–0x22
 
@@ -81,10 +81,10 @@ Fence formats carry opcode, tile mask and tag; the remaining bits are zero. DMA 
 | 47:40 | dv | Value/state column dimension, 1–128 |
 | 48 | slot | Raw/output ping-pong slot 0 or 1 |
 | 49 | prepared | CHUNK consumes an already prepared slot |
-| 50 | next_chunk | Enable the legal future preparation handoff |
+| 50 | next_chunk | Enable handoff to next-chunk preparation |
 | Other bits | reserved | Zero |
 
-PREPARE uses dimensions and slot; its prepared/next_chunk flags are zero. RELEASE (0x23) carries only the envelope and slot at bit 48. Release a slot after its output DMA response. H is shared across the ordered chunks of one head and must not be overwritten by preparing a future chunk.
+PREPARE uses dimensions and slot, with prepared/next_chunk set to zero. RELEASE (0x23) uses the envelope and slot at bit 48. Send RELEASE after the output DMA response to make that slot available again. Preparation writes the next chunk's inputs and transforms, while H remains the recurrent state shared by the ordered chunks of one head.
 
 ## Native recurrence format: 0x24–0x25
 
@@ -97,7 +97,7 @@ PREPARE uses dimensions and slot; its prepared/next_chunk flags are zero. RELEAS
 | 63:55 | state_base | Work row containing H; default 256 |
 | Other bits | reserved | Zero |
 
-STEP input uses six Operand rows per token: Q, K, V, FP32 decay/beta, corrected-E low and corrected-E high. STEP generates BF16 O and FP32 corrected E at Operand rows `512 + 3 * token` through `514 + 3 * token`. H row `(key, half)` is `state_base + 2 * key + half`. REBUILD reads K, decay and cached E, updating H without generating new O. The replay example loads cached E from an earlier actual RTL DMA_STORE.
+STEP input uses six Operand rows per token: Q, K, V, FP32 decay/beta, corrected-E low and corrected-E high. STEP generates BF16 O and FP32 corrected E at Operand rows `512 + 3 * token` through `514 + 3 * token`. H row `(key, half)` is `state_base + 2 * key + half`. REBUILD reads K, decay and cached E to update H. The replay example loads E saved by an earlier DMA_STORE.
 
 ## MMIO
 
@@ -117,7 +117,7 @@ The register window starts at 0x8000. Offsets below are relative to that base.
 
 Status bit 0 is idle, bit 1 submission-ready, bits 5:2 staged-word presence, bit 6 completion-available, bits 10:7 tile faults and bit 11 invalid-submit. Completion bit 31 is valid, bit 29 error, bit 28 DMA, bits 27:26 port, bits 25:24 tile, bits 23:16 opcode and bits 15:0 tag; bit 30 is reserved.
 
-The completion FIFO has 64 entries. The host must poll and drain it while submitting, rather than waiting until a long program has been submitted. `software/deltaflow/mmio.py` implements this bounded transport:
+The completion FIFO holds 64 entries. Poll it and consume completions while submitting instructions so new completions have space. `software/deltaflow/mmio.py` handles this submission loop:
 
 ```python
 from deltaflow.mmio import Transport
@@ -132,4 +132,4 @@ python -m deltaflow gemm --m 8192 --n 512 --k 2560 --output .local/programs/proj
 python -m deltaflow prefill --chunks 128 --output .local/programs/prefill8k.hex
 ```
 
-GEMM emits layout descriptors alongside the instruction file; pack all tensor payloads according to those descriptors. `Program` provides the same DMA, fence and recurrence builders for custom decode/replay applications. End-to-end examples and HBM images are generated as described in [Simulation](simulation.md).
+The GEMM compiler writes layout descriptors alongside the instruction file. Use those descriptors to pack tensors into the HBM lane streams. For custom decode or replay programs, use `Program` to build DMA, fence and recurrence instructions. [Simulation](simulation.md) shows how to generate complete example programs and HBM data files.
